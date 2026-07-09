@@ -49,6 +49,14 @@ GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
 GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
 GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # oauth or service_account
 
+# Write-tool configuration (see WRITE TOOLS section below).
+# GOOGLE_ADS_WRITE_CUSTOMER_ID is the ONE account write tools may modify.
+# It is deliberately NOT a tool parameter — set it per-workspace in .mcp.json.
+# If unset, every write tool fails loud. There is no fallback account.
+GOOGLE_ADS_WRITE_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_WRITE_CUSTOMER_ID", "")
+GOOGLE_ADS_MAX_DAILY_BUDGET_GBP = float(os.environ.get("GOOGLE_ADS_MAX_DAILY_BUDGET_GBP", "20"))
+MUTATIONS_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mutations.log")
+
 def format_customer_id(customer_id: str) -> str:
     """Format customer ID to ensure it's 10 digits without dashes."""
     # Convert to string if passed as integer or another type
@@ -1470,6 +1478,557 @@ async def list_resources(
     
     # Use your existing run_gaql function to execute this query
     return await run_gaql(customer_id, query)
+
+# ============================================================================
+# WRITE TOOLS (mutations)
+#
+# Safety model (do not weaken):
+#   1. All writes are locked to GOOGLE_ADS_WRITE_CUSTOMER_ID (env). Write tools
+#      take NO customer_id parameter, so the wrong account cannot be named.
+#   2. Every tool defaults to confirm=False: the REAL payload is sent with
+#      Google's validateOnly flag and a preview is returned. Nothing is applied
+#      until the same call is repeated with confirm=True.
+#   3. Campaigns, ad groups and ads are ALWAYS created PAUSED. Going live is a
+#      separate, explicit set_*_status call.
+#   4. Campaign budgets above GOOGLE_ADS_MAX_DAILY_BUDGET_GBP are rejected.
+#   5. There are deliberately NO delete/remove tools.
+#   6. Executed mutations are appended to mutations.log.
+# ============================================================================
+
+def _get_write_customer_id() -> str:
+    """Return the locked write-target account, failing loud if not configured."""
+    if not GOOGLE_ADS_WRITE_CUSTOMER_ID:
+        raise ValueError(
+            "No write account configured. Set GOOGLE_ADS_WRITE_CUSTOMER_ID in this "
+            "workspace's .mcp.json to the ONE account this folder may modify. "
+            "Write tools never fall back to the login account."
+        )
+    return format_customer_id(GOOGLE_ADS_WRITE_CUSTOMER_ID)
+
+def _post_mutate(resource: str, payload: dict, validate_only: bool) -> dict:
+    """POST a mutate request for the locked account. Raises on any API error."""
+    cid = _get_write_customer_id()
+    creds = get_credentials()
+    headers = get_headers(creds)
+
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/{resource}:mutate"
+    if validate_only:
+        payload = {**payload, "validateOnly": True}
+
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise ValueError(f"Google Ads API error ({response.status_code}): {response.text}")
+    return response.json()
+
+def _search_write_account(query: str) -> list:
+    """Run a GAQL search against the locked write account (read, no mutation)."""
+    cid = _get_write_customer_id()
+    creds = get_credentials()
+    headers = get_headers(creds)
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+    response = requests.post(url, headers=headers, json={"query": query})
+    if response.status_code != 200:
+        raise ValueError(f"Google Ads API error ({response.status_code}): {response.text}")
+    return response.json().get("results", [])
+
+def _audit_log(tool: str, summary: str) -> None:
+    """Append an executed mutation to mutations.log (gitignored)."""
+    cid = _get_write_customer_id()
+    line = f"{datetime.now().isoformat()} | {tool} | account={cid} | {summary}\n"
+    try:
+        with open(MUTATIONS_LOG_PATH, "a") as f:
+            f.write(line)
+    except Exception as e:
+        # The mutation already happened; a logging failure must be visible, not silent.
+        logger.error(f"AUDIT LOG WRITE FAILED ({e}); entry was: {line.strip()}")
+
+def _mutate_with_confirm(tool: str, resource: str, payload: dict,
+                         description_lines: List[str], confirm: bool) -> str:
+    """Shared preview/confirm flow for all write tools."""
+    cid = _get_write_customer_id()
+    header = [
+        f"Account: {cid} (locked write target)",
+        f"Action:  {tool}",
+        "-" * 50,
+    ]
+    if not confirm:
+        _post_mutate(resource, payload, validate_only=True)
+        return "\n".join(
+            ["PREVIEW — nothing has been applied", ""]
+            + header + description_lines + [
+                "-" * 50,
+                "Validated by Google (validateOnly): payload is well-formed and permitted.",
+                "To apply, call this tool again with confirm=true.",
+            ]
+        )
+
+    result = _post_mutate(resource, payload, validate_only=False)
+    # Per-resource mutates return {"results": [...]}; googleAds:mutate returns
+    # {"mutateOperationResponses": [...]} — support both.
+    created = [r.get("resourceName", "?") for r in result.get("results", [])]
+    for op in result.get("mutateOperationResponses", []):
+        for v in op.values():
+            if isinstance(v, dict) and "resourceName" in v:
+                created.append(v["resourceName"])
+    summary = "; ".join(description_lines)
+    _audit_log(tool, summary)
+    return "\n".join(
+        ["EXECUTED", ""]
+        + header + description_lines + [
+            "-" * 50,
+            "Result resource(s):",
+        ]
+        + [f"  {name}" for name in created]
+        + [f"Logged to {os.path.basename(MUTATIONS_LOG_PATH)}"]
+    )
+
+_VALID_MATCH_TYPES = ("EXACT", "PHRASE", "BROAD")
+# Name of the account-wide negative keyword list this server creates/reuses.
+_ACCOUNT_NEG_LIST_NAME = "Account-wide negatives (managed by MCP)"
+
+def _add_account_negatives(keywords: List[str], match_type: str, confirm: bool) -> str:
+    """
+    Account-level negative keywords. Google has no direct customer-level keyword
+    criterion; the supported mechanism is a negative keyword list (shared set)
+    attached account-wide via customerNegativeCriteria.negativeKeywordList.
+
+    The attach operation cannot reference a not-yet-created shared set (even with
+    temp ids), so: list + keywords are created atomically, then the attachment is
+    a second mutate on execute. Reuses/re-attaches our named list if it exists.
+    """
+    cid = _get_write_customer_id()
+
+    existing = _search_write_account(
+        "SELECT shared_set.id, shared_set.name FROM shared_set "
+        "WHERE shared_set.type = 'NEGATIVE_KEYWORDS' AND shared_set.status = 'ENABLED' "
+        f"AND shared_set.name = '{_ACCOUNT_NEG_LIST_NAME}'"
+    )
+    shared_set = existing[0]["sharedSet"]["resourceName"] if existing else None
+
+    attached = False
+    if shared_set:
+        rows = _search_write_account(
+            "SELECT customer_negative_criterion.resource_name, "
+            "customer_negative_criterion.negative_keyword_list.shared_set "
+            "FROM customer_negative_criterion "
+            "WHERE customer_negative_criterion.type = 'NEGATIVE_KEYWORD_LIST'"
+        )
+        attached = any(
+            r.get("customerNegativeCriterion", {}).get("negativeKeywordList", {}).get("sharedSet") == shared_set
+            for r in rows
+        )
+
+    def keyword_ops(ss: str) -> list:
+        return [{"create": {"sharedSet": ss, "keyword": {"text": kw, "matchType": match_type}}}
+                for kw in keywords]
+
+    state = ("existing list, already attached" if shared_set and attached
+             else "existing list, will re-attach account-wide" if shared_set
+             else "list will be CREATED and attached account-wide")
+    lines = [f"Add {len(keywords)} NEGATIVE keyword(s) [{match_type}] to "
+             f"'{_ACCOUNT_NEG_LIST_NAME}' ({state}):"]
+    lines += [f'  - "{kw}"' for kw in keywords]
+    header = [f"Account: {cid} (locked write target)", "Action:  add_negative_keywords", "-" * 50]
+
+    if not confirm:
+        if shared_set:
+            _post_mutate("sharedCriteria", {"operations": keyword_ops(shared_set)}, validate_only=True)
+        else:
+            temp = f"customers/{cid}/sharedSets/-1"
+            ops = [{"sharedSetOperation": {"create": {
+                "resourceName": temp, "name": _ACCOUNT_NEG_LIST_NAME, "type": "NEGATIVE_KEYWORDS",
+            }}}]
+            ops += [{"sharedCriterionOperation": {"create": {
+                "sharedSet": temp, "keyword": {"text": kw, "matchType": match_type},
+            }}} for kw in keywords]
+            _post_mutate("googleAds", {"mutateOperations": ops}, validate_only=True)
+        return "\n".join(["PREVIEW — nothing has been applied", ""] + header + lines + [
+            "-" * 50,
+            "Validated by Google (validateOnly): payload is well-formed and permitted.",
+            "To apply, call this tool again with confirm=true.",
+        ])
+
+    # Execute: (1) ensure list exists with the keywords, (2) ensure it is attached.
+    if shared_set:
+        _post_mutate("sharedCriteria", {"operations": keyword_ops(shared_set)}, validate_only=False)
+    else:
+        temp = f"customers/{cid}/sharedSets/-1"
+        ops = [{"sharedSetOperation": {"create": {
+            "resourceName": temp, "name": _ACCOUNT_NEG_LIST_NAME, "type": "NEGATIVE_KEYWORDS",
+        }}}]
+        ops += [{"sharedCriterionOperation": {"create": {
+            "sharedSet": temp, "keyword": {"text": kw, "matchType": match_type},
+        }}} for kw in keywords]
+        result = _post_mutate("googleAds", {"mutateOperations": ops}, validate_only=False)
+        for op in result.get("mutateOperationResponses", []):
+            ss = op.get("sharedSetResult", {}).get("resourceName")
+            if ss:
+                shared_set = ss
+        if not shared_set:
+            raise ValueError("Shared set creation returned no resource name — keywords may "
+                             "exist in an unattached list; check the account's shared library.")
+
+    if not attached:
+        # Fail loud if attach fails: the list exists but is NOT protecting campaigns yet.
+        try:
+            _post_mutate("customerNegativeCriteria",
+                         {"operations": [{"create": {"negativeKeywordList": {"sharedSet": shared_set}}}]},
+                         validate_only=False)
+        except Exception as e:
+            raise ValueError(
+                f"Keywords were added to '{_ACCOUNT_NEG_LIST_NAME}' but ATTACHING it "
+                f"account-wide FAILED — the negatives are NOT active yet. "
+                f"Attach error: {e}"
+            )
+
+    _audit_log("add_negative_keywords",
+               f"{len(keywords)} account-level negatives [{match_type}] via '{_ACCOUNT_NEG_LIST_NAME}'")
+    return "\n".join(["EXECUTED", ""] + header + lines + [
+        "-" * 50,
+        f"List: {shared_set} (attached account-wide)",
+        f"Logged to {os.path.basename(MUTATIONS_LOG_PATH)}",
+    ])
+
+@mcp.tool()
+async def add_negative_keywords(
+    keywords: List[str] = Field(description="Negative keyword texts to add, e.g. ['free', 'jobs']"),
+    level: str = Field(default="campaign", description="'campaign' (needs campaign_id) or 'account'"),
+    campaign_id: str = Field(default="", description="Campaign ID (digits only) — required when level='campaign'"),
+    match_type: str = Field(default="PHRASE", description="EXACT, PHRASE or BROAD"),
+    confirm: bool = Field(default=False, description="False = preview only (validateOnly). True = actually apply.")
+) -> str:
+    """
+    Add negative keywords to the locked write account (campaign or account level).
+
+    Two-step: call with confirm=false first to get a validated preview, show it
+    to the user, then repeat with confirm=true to apply.
+
+    Returns:
+        Preview or execution report.
+    """
+    try:
+        match_type = match_type.upper()
+        if match_type not in _VALID_MATCH_TYPES:
+            return f"Error: match_type must be one of {_VALID_MATCH_TYPES}, got '{match_type}'"
+        if not keywords:
+            return "Error: keywords list is empty"
+        if level not in ("campaign", "account"):
+            return f"Error: level must be 'campaign' or 'account', got '{level}'"
+
+        cid = _get_write_customer_id()
+        if level == "campaign":
+            if not campaign_id.isdigit():
+                return "Error: campaign_id (digits only) is required when level='campaign'"
+            resource = "campaignCriteria"
+            operations = [{
+                "create": {
+                    "campaign": f"customers/{cid}/campaigns/{campaign_id}",
+                    "negative": True,
+                    "keyword": {"text": kw, "matchType": match_type},
+                }
+            } for kw in keywords]
+            where = f"campaign {campaign_id}"
+        else:
+            return _add_account_negatives(keywords, match_type, confirm)
+
+        lines = [f"Add {len(keywords)} NEGATIVE keyword(s) [{match_type}] at {where}:"]
+        lines += [f'  - "{kw}"' for kw in keywords]
+        return _mutate_with_confirm("add_negative_keywords", resource,
+                                    {"operations": operations}, lines, confirm)
+    except Exception as e:
+        return f"Error adding negative keywords: {str(e)}"
+
+_VALID_STATUSES = ("ENABLED", "PAUSED")
+
+@mcp.tool()
+async def set_campaign_status(
+    campaign_id: str = Field(description="Campaign ID (digits only) in the locked write account"),
+    status: str = Field(description="ENABLED or PAUSED. ENABLED makes the campaign LIVE and spending."),
+    confirm: bool = Field(default=False, description="False = preview only. True = actually apply.")
+) -> str:
+    """
+    Pause or enable a campaign in the locked write account.
+
+    ENABLED means the campaign goes LIVE and can spend money — only call with
+    confirm=true after the user has explicitly approved going live.
+
+    Returns:
+        Preview or execution report.
+    """
+    try:
+        status = status.upper()
+        if status not in _VALID_STATUSES:
+            return f"Error: status must be one of {_VALID_STATUSES}, got '{status}'"
+        if not campaign_id.isdigit():
+            return "Error: campaign_id must be digits only"
+
+        cid = _get_write_customer_id()
+        payload = {"operations": [{
+            "update": {
+                "resourceName": f"customers/{cid}/campaigns/{campaign_id}",
+                "status": status,
+            },
+            "updateMask": "status",
+        }]}
+        warning = "  *** This makes the campaign LIVE and able to spend. ***" if status == "ENABLED" else ""
+        lines = [f"Set campaign {campaign_id} status -> {status}"] + ([warning] if warning else [])
+        return _mutate_with_confirm("set_campaign_status", "campaigns", payload, lines, confirm)
+    except Exception as e:
+        return f"Error setting campaign status: {str(e)}"
+
+@mcp.tool()
+async def set_ad_status(
+    ad_group_id: str = Field(description="Ad group ID (digits only)"),
+    ad_id: str = Field(description="Ad ID (digits only)"),
+    status: str = Field(description="ENABLED or PAUSED. ENABLED makes the ad eligible to serve."),
+    confirm: bool = Field(default=False, description="False = preview only. True = actually apply.")
+) -> str:
+    """
+    Pause or enable a single ad in the locked write account.
+
+    Returns:
+        Preview or execution report.
+    """
+    try:
+        status = status.upper()
+        if status not in _VALID_STATUSES:
+            return f"Error: status must be one of {_VALID_STATUSES}, got '{status}'"
+        if not (ad_group_id.isdigit() and ad_id.isdigit()):
+            return "Error: ad_group_id and ad_id must be digits only"
+
+        cid = _get_write_customer_id()
+        payload = {"operations": [{
+            "update": {
+                "resourceName": f"customers/{cid}/adGroupAds/{ad_group_id}~{ad_id}",
+                "status": status,
+            },
+            "updateMask": "status",
+        }]}
+        lines = [f"Set ad {ad_id} (ad group {ad_group_id}) status -> {status}"]
+        return _mutate_with_confirm("set_ad_status", "adGroupAds", payload, lines, confirm)
+    except Exception as e:
+        return f"Error setting ad status: {str(e)}"
+
+@mcp.tool()
+async def create_campaign(
+    name: str = Field(description="Campaign name"),
+    daily_budget_gbp: float = Field(description=f"Daily budget in GBP (account currency). Hard-capped by GOOGLE_ADS_MAX_DAILY_BUDGET_GBP."),
+    confirm: bool = Field(default=False, description="False = preview only. True = actually create (PAUSED).")
+) -> str:
+    """
+    Create a Search campaign in the locked write account. ALWAYS created PAUSED
+    with Manual CPC bidding — going live is a separate set_campaign_status call.
+
+    Creates a dedicated (non-shared) daily budget and the campaign atomically.
+
+    Returns:
+        Preview or execution report (includes the new campaign resource name).
+    """
+    try:
+        if not name.strip():
+            return "Error: campaign name is empty"
+        if daily_budget_gbp <= 0:
+            return "Error: daily_budget_gbp must be positive"
+        if daily_budget_gbp > GOOGLE_ADS_MAX_DAILY_BUDGET_GBP:
+            return (f"Error: daily budget £{daily_budget_gbp:.2f} exceeds the configured cap of "
+                    f"£{GOOGLE_ADS_MAX_DAILY_BUDGET_GBP:.2f} (GOOGLE_ADS_MAX_DAILY_BUDGET_GBP). "
+                    f"Raise the cap in .mcp.json deliberately if this is intended.")
+
+        cid = _get_write_customer_id()
+        budget_micros = int(round(daily_budget_gbp * 1_000_000))
+        # googleAds:mutate lets the budget and campaign be created atomically,
+        # with the campaign referencing the budget via a temporary resource id.
+        payload = {"mutateOperations": [
+            {"campaignBudgetOperation": {"create": {
+                "resourceName": f"customers/{cid}/campaignBudgets/-1",
+                "name": f"{name} budget",
+                "amountMicros": str(budget_micros),
+                "deliveryMethod": "STANDARD",
+                "explicitlyShared": False,
+            }}},
+            {"campaignOperation": {"create": {
+                "name": name,
+                "status": "PAUSED",  # hard-coded by design — do not parameterize
+                "advertisingChannelType": "SEARCH",
+                "manualCpc": {},
+                # Required by v23 (EU political ads transparency). This server is
+                # for commercial campaigns only — political ads are out of scope.
+                "containsEuPoliticalAdvertising": "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+                "campaignBudget": f"customers/{cid}/campaignBudgets/-1",
+                "networkSettings": {
+                    "targetGoogleSearch": True,
+                    "targetSearchNetwork": False,
+                    "targetContentNetwork": False,
+                    "targetPartnerSearchNetwork": False,
+                },
+            }}},
+        ]}
+        lines = [
+            f'Create SEARCH campaign "{name}"',
+            f"  Budget: £{daily_budget_gbp:.2f}/day (dedicated, standard delivery)",
+            "  Bidding: Manual CPC",
+            "  Network: Google Search only",
+            "  Status: PAUSED (going live requires a separate set_campaign_status call)",
+        ]
+        return _mutate_with_confirm("create_campaign", "googleAds", payload, lines, confirm)
+    except Exception as e:
+        return f"Error creating campaign: {str(e)}"
+
+@mcp.tool()
+async def create_ad_group(
+    campaign_id: str = Field(description="Campaign ID (digits only) the ad group belongs to"),
+    name: str = Field(description="Ad group name"),
+    default_cpc_gbp: float = Field(default=1.0, description="Default max CPC bid in GBP for the ad group"),
+    confirm: bool = Field(default=False, description="False = preview only. True = actually create (PAUSED).")
+) -> str:
+    """
+    Create a Search ad group in the locked write account. ALWAYS created PAUSED.
+
+    Returns:
+        Preview or execution report.
+    """
+    try:
+        if not campaign_id.isdigit():
+            return "Error: campaign_id must be digits only"
+        if not name.strip():
+            return "Error: ad group name is empty"
+        if default_cpc_gbp <= 0:
+            return "Error: default_cpc_gbp must be positive"
+
+        cid = _get_write_customer_id()
+        payload = {"operations": [{
+            "create": {
+                "name": name,
+                "campaign": f"customers/{cid}/campaigns/{campaign_id}",
+                "status": "PAUSED",  # hard-coded by design
+                "type": "SEARCH_STANDARD",
+                "cpcBidMicros": str(int(round(default_cpc_gbp * 1_000_000))),
+            }
+        }]}
+        lines = [
+            f'Create ad group "{name}" in campaign {campaign_id}',
+            f"  Default max CPC: £{default_cpc_gbp:.2f}",
+            "  Status: PAUSED",
+        ]
+        return _mutate_with_confirm("create_ad_group", "adGroups", payload, lines, confirm)
+    except Exception as e:
+        return f"Error creating ad group: {str(e)}"
+
+@mcp.tool()
+async def add_keywords(
+    ad_group_id: str = Field(description="Ad group ID (digits only) to add keywords to"),
+    keywords: List[str] = Field(description="Keyword texts to add"),
+    match_type: str = Field(default="PHRASE", description="EXACT or PHRASE. BROAD additionally requires allow_broad=true."),
+    allow_broad: bool = Field(default=False, description="Must be true to permit BROAD match (spend risk)"),
+    confirm: bool = Field(default=False, description="False = preview only. True = actually apply.")
+) -> str:
+    """
+    Add (positive) keywords to an ad group in the locked write account.
+
+    Keywords are created ENABLED but only serve once their campaign/ad group is
+    enabled — creation stays inert while everything upstream is PAUSED.
+
+    Returns:
+        Preview or execution report.
+    """
+    try:
+        match_type = match_type.upper()
+        if match_type not in _VALID_MATCH_TYPES:
+            return f"Error: match_type must be one of {_VALID_MATCH_TYPES}, got '{match_type}'"
+        if match_type == "BROAD" and not allow_broad:
+            return ("Error: BROAD match can spend widely and is blocked by default. "
+                    "Pass allow_broad=true only if the user explicitly chose broad match.")
+        if not ad_group_id.isdigit():
+            return "Error: ad_group_id must be digits only"
+        if not keywords:
+            return "Error: keywords list is empty"
+
+        cid = _get_write_customer_id()
+        operations = [{
+            "create": {
+                "adGroup": f"customers/{cid}/adGroups/{ad_group_id}",
+                "status": "ENABLED",
+                "keyword": {"text": kw, "matchType": match_type},
+            }
+        } for kw in keywords]
+        lines = [f"Add {len(keywords)} keyword(s) [{match_type}] to ad group {ad_group_id}:"]
+        lines += [f'  - "{kw}"' for kw in keywords]
+        return _mutate_with_confirm("add_keywords", "adGroupCriteria",
+                                    {"operations": operations}, lines, confirm)
+    except Exception as e:
+        return f"Error adding keywords: {str(e)}"
+
+@mcp.tool()
+async def create_responsive_search_ad(
+    ad_group_id: str = Field(description="Ad group ID (digits only) the ad belongs to"),
+    headlines: List[str] = Field(description="3-15 headlines, each max 30 characters"),
+    descriptions: List[str] = Field(description="2-4 descriptions, each max 90 characters"),
+    final_url: str = Field(description="Landing page URL (must start with http:// or https://)"),
+    path1: str = Field(default="", description="Optional display path 1 (max 15 chars)"),
+    path2: str = Field(default="", description="Optional display path 2 (max 15 chars, requires path1)"),
+    confirm: bool = Field(default=False, description="False = preview only. True = actually create (PAUSED).")
+) -> str:
+    """
+    Create a Responsive Search Ad in the locked write account. ALWAYS created
+    PAUSED — the user reviews it (in preview here and/or the Ads UI) before it
+    is enabled via set_ad_status.
+
+    Returns:
+        Preview or execution report.
+    """
+    try:
+        if not ad_group_id.isdigit():
+            return "Error: ad_group_id must be digits only"
+        # Validate RSA limits client-side so previews fail fast with clear messages
+        if not (3 <= len(headlines) <= 15):
+            return f"Error: RSA needs 3-15 headlines, got {len(headlines)}"
+        if not (2 <= len(descriptions) <= 4):
+            return f"Error: RSA needs 2-4 descriptions, got {len(descriptions)}"
+        too_long = [h for h in headlines if len(h) > 30]
+        if too_long:
+            return f"Error: headline(s) over 30 chars: {too_long}"
+        too_long = [d for d in descriptions if len(d) > 90]
+        if too_long:
+            return f"Error: description(s) over 90 chars: {too_long}"
+        if not final_url.startswith(("http://", "https://")):
+            return "Error: final_url must start with http:// or https://"
+        if len(path1) > 15 or len(path2) > 15:
+            return "Error: path1/path2 max 15 characters each"
+        if path2 and not path1:
+            return "Error: path2 requires path1"
+
+        cid = _get_write_customer_id()
+        ad = {
+            "finalUrls": [final_url],
+            "responsiveSearchAd": {
+                "headlines": [{"text": h} for h in headlines],
+                "descriptions": [{"text": d} for d in descriptions],
+            },
+        }
+        if path1:
+            ad["responsiveSearchAd"]["path1"] = path1
+        if path2:
+            ad["responsiveSearchAd"]["path2"] = path2
+
+        payload = {"operations": [{
+            "create": {
+                "adGroup": f"customers/{cid}/adGroups/{ad_group_id}",
+                "status": "PAUSED",  # hard-coded by design
+                "ad": ad,
+            }
+        }]}
+        lines = [f"Create Responsive Search Ad in ad group {ad_group_id} (PAUSED):",
+                 f"  Final URL: {final_url}"]
+        if path1:
+            lines.append(f"  Display path: /{path1}" + (f"/{path2}" if path2 else ""))
+        lines.append(f"  Headlines ({len(headlines)}):")
+        lines += [f'    - "{h}"' for h in headlines]
+        lines.append(f"  Descriptions ({len(descriptions)}):")
+        lines += [f'    - "{d}"' for d in descriptions]
+        return _mutate_with_confirm("create_responsive_search_ad", "adGroupAds",
+                                    payload, lines, confirm)
+    except Exception as e:
+        return f"Error creating responsive search ad: {str(e)}"
 
 if __name__ == "__main__":
     # Start the MCP server on stdio transport

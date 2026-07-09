@@ -24,6 +24,9 @@ token.json
 # MCP config (contains developer token — project-scoped, never commit)
 .mcp.json
 
+# Audit log of executed mutations (local record, never commit)
+mutations.log
+
 # Editor-specific files
 .vscode/
 .idea/
