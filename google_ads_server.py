@@ -1542,8 +1542,56 @@ def _audit_log(tool: str, summary: str) -> None:
         # The mutation already happened; a logging failure must be visible, not silent.
         logger.error(f"AUDIT LOG WRITE FAILED ({e}); entry was: {line.strip()}")
 
+_ADS_UI_BASE = "https://ads.google.com/aw"
+
+def _ui_links_for_resources(resource_names: List[str]) -> List[str]:
+    """
+    Build Google Ads UI deep links for mutated resources so the user can
+    click straight through and check the change. Resource names look like
+    customers/{cid}/{type}/{id} (composite ids use '~').
+
+    Note: these links open in whichever Ads account the browser last used —
+    if the wrong account loads, switch account in the top bar; the ids only
+    resolve in the locked write account.
+    """
+    links = []
+    for rn in resource_names:
+        parts = rn.split("/")
+        if len(parts) < 4:
+            continue
+        rtype, rid = parts[2], parts[3]
+        if rtype == "campaigns":
+            links.append(f"{_ADS_UI_BASE}/campaigns?campaignId={rid}")
+        elif rtype == "adGroups":
+            links.append(f"{_ADS_UI_BASE}/ads?adGroupIdForAds={rid}")
+        elif rtype == "adGroupAds":
+            ad_group_id = rid.split("~")[0]
+            links.append(f"{_ADS_UI_BASE}/ads?adGroupIdForAds={ad_group_id}")
+        elif rtype == "adGroupCriteria":
+            ad_group_id = rid.split("~")[0]
+            links.append(f"{_ADS_UI_BASE}/keywords?adGroupIdForKeywords={ad_group_id}")
+        elif rtype == "campaignCriteria":
+            campaign_id = rid.split("~")[0]
+            links.append(f"{_ADS_UI_BASE}/keywords/negative?campaignId={campaign_id}")
+        elif rtype in ("sharedSets", "sharedCriteria", "customerNegativeCriteria"):
+            links.append(f"{_ADS_UI_BASE}/negativekeywordlists")
+    # Dedupe, preserving order
+    seen = set()
+    deduped = []
+    for link in links:
+        if link not in seen:
+            seen.add(link)
+            deduped.append(link)
+    return deduped
+
+def _link_lines(links: List[str]) -> List[str]:
+    if not links:
+        return []
+    return ["Check in Google Ads:"] + [f"  {link}" for link in links]
+
 def _mutate_with_confirm(tool: str, resource: str, payload: dict,
-                         description_lines: List[str], confirm: bool) -> str:
+                         description_lines: List[str], confirm: bool,
+                         ui_link: str = "") -> str:
     """Shared preview/confirm flow for all write tools."""
     cid = _get_write_customer_id()
     header = [
@@ -1560,6 +1608,7 @@ def _mutate_with_confirm(tool: str, resource: str, payload: dict,
                 "Validated by Google (validateOnly): payload is well-formed and permitted.",
                 "To apply, call this tool again with confirm=true.",
             ]
+            + _link_lines([ui_link] if ui_link else [])
         )
 
     result = _post_mutate(resource, payload, validate_only=False)
@@ -1572,6 +1621,9 @@ def _mutate_with_confirm(tool: str, resource: str, payload: dict,
                 created.append(v["resourceName"])
     summary = "; ".join(description_lines)
     _audit_log(tool, summary)
+    links = _ui_links_for_resources(created)
+    if ui_link and ui_link not in links:
+        links.insert(0, ui_link)
     return "\n".join(
         ["EXECUTED", ""]
         + header + description_lines + [
@@ -1579,6 +1631,7 @@ def _mutate_with_confirm(tool: str, resource: str, payload: dict,
             "Result resource(s):",
         ]
         + [f"  {name}" for name in created]
+        + _link_lines(links)
         + [f"Logged to {os.path.basename(MUTATIONS_LOG_PATH)}"]
     )
 
@@ -1646,7 +1699,7 @@ def _add_account_negatives(keywords: List[str], match_type: str, confirm: bool) 
             "-" * 50,
             "Validated by Google (validateOnly): payload is well-formed and permitted.",
             "To apply, call this tool again with confirm=true.",
-        ])
+        ] + _link_lines([f"{_ADS_UI_BASE}/negativekeywordlists"]))
 
     # Execute: (1) ensure list exists with the keywords, (2) ensure it is attached.
     if shared_set:
@@ -1686,6 +1739,7 @@ def _add_account_negatives(keywords: List[str], match_type: str, confirm: bool) 
     return "\n".join(["EXECUTED", ""] + header + lines + [
         "-" * 50,
         f"List: {shared_set} (attached account-wide)",
+    ] + _link_lines([f"{_ADS_UI_BASE}/negativekeywordlists"]) + [
         f"Logged to {os.path.basename(MUTATIONS_LOG_PATH)}",
     ])
 
@@ -1734,7 +1788,8 @@ async def add_negative_keywords(
         lines = [f"Add {len(keywords)} NEGATIVE keyword(s) [{match_type}] at {where}:"]
         lines += [f'  - "{kw}"' for kw in keywords]
         return _mutate_with_confirm("add_negative_keywords", resource,
-                                    {"operations": operations}, lines, confirm)
+                                    {"operations": operations}, lines, confirm,
+                                    ui_link=f"{_ADS_UI_BASE}/keywords/negative?campaignId={campaign_id}")
     except Exception as e:
         return f"Error adding negative keywords: {str(e)}"
 
@@ -1772,7 +1827,8 @@ async def set_campaign_status(
         }]}
         warning = "  *** This makes the campaign LIVE and able to spend. ***" if status == "ENABLED" else ""
         lines = [f"Set campaign {campaign_id} status -> {status}"] + ([warning] if warning else [])
-        return _mutate_with_confirm("set_campaign_status", "campaigns", payload, lines, confirm)
+        return _mutate_with_confirm("set_campaign_status", "campaigns", payload, lines, confirm,
+                                    ui_link=f"{_ADS_UI_BASE}/campaigns?campaignId={campaign_id}")
     except Exception as e:
         return f"Error setting campaign status: {str(e)}"
 
@@ -1805,7 +1861,8 @@ async def set_ad_status(
             "updateMask": "status",
         }]}
         lines = [f"Set ad {ad_id} (ad group {ad_group_id}) status -> {status}"]
-        return _mutate_with_confirm("set_ad_status", "adGroupAds", payload, lines, confirm)
+        return _mutate_with_confirm("set_ad_status", "adGroupAds", payload, lines, confirm,
+                                    ui_link=f"{_ADS_UI_BASE}/ads?adGroupIdForAds={ad_group_id}")
     except Exception as e:
         return f"Error setting ad status: {str(e)}"
 
@@ -1910,7 +1967,8 @@ async def create_ad_group(
             f"  Default max CPC: £{default_cpc_gbp:.2f}",
             "  Status: PAUSED",
         ]
-        return _mutate_with_confirm("create_ad_group", "adGroups", payload, lines, confirm)
+        return _mutate_with_confirm("create_ad_group", "adGroups", payload, lines, confirm,
+                                    ui_link=f"{_ADS_UI_BASE}/adgroups?campaignId={campaign_id}")
     except Exception as e:
         return f"Error creating ad group: {str(e)}"
 
@@ -1954,7 +2012,8 @@ async def add_keywords(
         lines = [f"Add {len(keywords)} keyword(s) [{match_type}] to ad group {ad_group_id}:"]
         lines += [f'  - "{kw}"' for kw in keywords]
         return _mutate_with_confirm("add_keywords", "adGroupCriteria",
-                                    {"operations": operations}, lines, confirm)
+                                    {"operations": operations}, lines, confirm,
+                                    ui_link=f"{_ADS_UI_BASE}/keywords?adGroupIdForKeywords={ad_group_id}")
     except Exception as e:
         return f"Error adding keywords: {str(e)}"
 
@@ -2026,7 +2085,8 @@ async def create_responsive_search_ad(
         lines.append(f"  Descriptions ({len(descriptions)}):")
         lines += [f'    - "{d}"' for d in descriptions]
         return _mutate_with_confirm("create_responsive_search_ad", "adGroupAds",
-                                    payload, lines, confirm)
+                                    payload, lines, confirm,
+                                    ui_link=f"{_ADS_UI_BASE}/ads?adGroupIdForAds={ad_group_id}")
     except Exception as e:
         return f"Error creating responsive search ad: {str(e)}"
 
